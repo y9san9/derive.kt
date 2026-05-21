@@ -1,0 +1,4 @@
+echo "Publish to Maven Local..." &&
+./gradlew --no-daemon publishToMavenLocal -q &&
+echo "Running sample..." &&
+cd sample && ./gradlew --no-daemon jvmRun -PmainClass=MainKt -q
