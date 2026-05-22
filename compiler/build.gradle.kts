@@ -14,6 +14,9 @@ kotlin {
         optIn.add(
             "org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi",
         )
+        optIn.add(
+            "org.jetbrains.kotlin.DeprecatedForRemovalCompilerApi",
+        )
     }
 }
 
