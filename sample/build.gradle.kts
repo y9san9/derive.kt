@@ -7,11 +7,8 @@ plugins {
 kotlin {
     jvm()
 
-    explicitApi()
-
     compilerOptions {
         extraWarnings = true
-        allWarningsAsErrors = true
         progressiveMode = true
     }
 

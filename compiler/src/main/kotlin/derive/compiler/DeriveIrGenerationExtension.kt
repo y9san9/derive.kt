@@ -8,7 +8,9 @@ import org.jetbrains.kotlin.ir.types.classOrNull
 import org.jetbrains.kotlin.ir.util.hasAnnotation
 import org.jetbrains.kotlin.ir.util.isTopLevel
 import org.jetbrains.kotlin.ir.util.packageFqName
+import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.Name
 
 private val DeriveFqName = FqName("derive.Derive")
 
@@ -22,33 +24,35 @@ public class DeriveIrGenerationExtension : IrGenerationExtension {
         val deriveStubs = mutableMapOf<String, IrSimpleFunction>()
         val overloadStubs = mutableMapOf<String, IrSimpleFunction>()
 
-        for (file in moduleFragment.files) {
-            for (decl in file.declarations) {
-                if (decl is IrSimpleFunction) {
-                    if (decl.isTopLevel && decl.hasAnnotation(DeriveFqName)) {
-                        deriveFunctions.add(decl)
+        val deriveDoubleClassId = ClassId(
+            FqName("derive"),
+            Name.identifier("DeriveDouble"),
+        )
+
+        val allFunctions = moduleFragment.files
+            .flatMap { it.declarations.filterIsInstance<IrSimpleFunction>() }
+
+        for (function in allFunctions) {
+            if (function.isTopLevel && function.hasAnnotation(DeriveFqName)) {
+                deriveFunctions.add(function)
+            }
+
+            val name = function.name.asString()
+            val isDeriveAnnotated = function.hasAnnotation(DeriveFqName)
+            if (name.endsWith("Derive") && !isDeriveAnnotated) {
+                deriveStubs[name] = function
+            } else if (function.valueParameters.size == 1) {
+                val paramClassId = function.valueParameters[0].type
+                    .classOrNull
+                    ?.owner
+                    ?.let { owner ->
+                        ClassId(
+                            owner.packageFqName ?: return@let null,
+                            owner.name,
+                        )
                     }
-                    val name = decl.name.asString()
-                    if (name.endsWith("Derive") &&
-                        !decl.hasAnnotation(DeriveFqName)
-                    ) {
-                        deriveStubs[name] = decl
-                    } else if (decl.valueParameters.size == 1 &&
-                        !decl.hasAnnotation(DeriveFqName)
-                    ) {
-                        val paramType = decl.valueParameters[0].type
-                        val classId = paramType.classOrNull?.owner?.symbol
-                            ?.let { sym ->
-                                org.jetbrains.kotlin.name.ClassId(
-                                    sym.owner.packageFqName
-                                        ?: return@let null,
-                                    sym.owner.name,
-                                )
-                            }
-                        if (classId?.asString() == "derive/DeriveDouble") {
-                            overloadStubs[name] = decl
-                        }
-                    }
+                if (paramClassId == deriveDoubleClassId) {
+                    overloadStubs[name] = function
                 }
             }
         }

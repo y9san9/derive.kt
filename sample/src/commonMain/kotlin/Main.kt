@@ -1,8 +1,10 @@
 import derive.Derive
 import derive.derive
 import derive.derivative
-import kotlin.math.sin
+import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.random.Random
 
 // Simple function: f(x) = x*x + 5*x + 5
 // f'(x) = 2x + 5
@@ -32,7 +34,7 @@ private fun gradientDescent(
     var x = start
     repeat(maxSteps) {
         val grad = derivative(x)
-        if (kotlin.math.abs(grad) < tolerance) {
+        if (abs(grad) < tolerance) {
             return x to function(x)
         }
         x -= learningRate * grad
@@ -49,11 +51,7 @@ private fun monteCarlo(
     var bestX = range.start
     var bestY = function(bestX)
     repeat(samples) {
-        val x = range.start +
-            kotlin.random.Random.nextDouble(
-                0.0,
-                range.endInclusive - range.start,
-            )
+        val x = range.start + Random.nextDouble(0.0, range.endInclusive - range.start)
         val y = function(x)
         if (y < bestY) {
             bestX = x
@@ -77,16 +75,12 @@ private fun monteCarloGradient(
     var bestX = range.start
     var bestY = function(bestX)
     repeat(randomStarts) {
-        val startX = range.start +
-            kotlin.random.Random.nextDouble(
-                0.0,
-                range.endInclusive - range.start,
-            )
+        val startX = range.start + Random.nextDouble(0.0, range.endInclusive - range.start)
         val (x, y) = gradientDescent(
             startX,
             learningRate,
             maxSteps,
-            1e-8,
+            tolerance = 1e-8,
             function = function,
             derivative = derivative,
         )
@@ -110,14 +104,13 @@ private fun printResults(
     println()
 }
 
-private fun main() {
+fun main() {
     // First, test simple derivative
     println("=== Simple Derivative Test ===")
+    println("  f(3) = ${f(3.0)}")
     val simpleDeriv = derive { f(3.0) }
     println("  f'(3) = $simpleDeriv (expected: 11.0)")
-    require(
-        kotlin.math.abs(simpleDeriv - 11.0) < 0.001,
-    ) { "Simple derivative test failed!" }
+    require(abs(simpleDeriv - 11.0) < 0.001) { "Simple derivative test failed!" }
     println("  PASSED")
     println()
 
@@ -126,9 +119,7 @@ private fun main() {
     val testX = 2.5
     val varDeriv = derive { f(testX) }
     println("  f'($testX) = $varDeriv (expected: 10.0)")
-    require(
-        kotlin.math.abs(varDeriv - 10.0) < 0.001,
-    ) { "Variable derivative test failed!" }
+    require(abs(varDeriv - 10.0) < 0.001) { "Variable derivative test failed!" }
     println("  PASSED")
     println()
 
@@ -205,12 +196,9 @@ private fun main() {
 
     // Numerical derivative for comparison
     val h = 1e-7
-    val numerical = (objective(testX + h) - objective(testX - h)) /
-        (2.0 * h)
+    val numerical = (objective(testX + h) - objective(testX - h)) / (2.0 * h)
     println("  Numerical g'($testX) = $numerical")
-    println(
-        "  Difference: ${kotlin.math.abs(deriv - numerical)}",
-    )
+    println("  Difference: ${abs(deriv - numerical)}")
     println()
 
     println("All optimizations completed!")

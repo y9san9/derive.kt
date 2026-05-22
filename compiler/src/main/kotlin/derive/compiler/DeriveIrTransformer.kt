@@ -1,14 +1,19 @@
 package derive.compiler
 
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
-import org.jetbrains.kotlin.ir.IrStatement
+import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
+import org.jetbrains.kotlin.descriptors.Modality
+import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.builders.declarations.addValueParameter
 import org.jetbrains.kotlin.ir.builders.declarations.buildFun
+import org.jetbrains.kotlin.ir.declarations.IrDeclaration
 import org.jetbrains.kotlin.ir.declarations.IrDeclarationContainer
+import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
 import org.jetbrains.kotlin.ir.declarations.IrFunction
 import org.jetbrains.kotlin.ir.declarations.IrProperty
 import org.jetbrains.kotlin.ir.declarations.IrSimpleFunction
 import org.jetbrains.kotlin.ir.expressions.IrBlockBody
+import org.jetbrains.kotlin.ir.expressions.IrBody
 import org.jetbrains.kotlin.ir.expressions.IrCall
 import org.jetbrains.kotlin.ir.expressions.IrConst
 import org.jetbrains.kotlin.ir.expressions.IrConstKind
@@ -29,6 +34,7 @@ import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
 import org.jetbrains.kotlin.ir.symbols.IrConstructorSymbol
 import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.IrSimpleFunctionSymbol
+import org.jetbrains.kotlin.ir.symbols.IrValueParameterSymbol
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.defaultType
@@ -36,6 +42,7 @@ import org.jetbrains.kotlin.ir.util.SYNTHETIC_OFFSET
 import org.jetbrains.kotlin.ir.util.constructors
 import org.jetbrains.kotlin.ir.util.deepCopyWithSymbols
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
+import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.name.CallableId
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
@@ -53,7 +60,8 @@ private val DerivativeCallableId = CallableId(
     Name.identifier("derivative"),
 )
 
-@OptIn(org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi::class)
+@Suppress("DEPRECATION")
+@OptIn(ExperimentalCompilerApi::class)
 public class DeriveIrTransformer(
     private val context: IrPluginContext,
     private val deriveFunctions: List<IrSimpleFunction>,
@@ -83,8 +91,9 @@ public class DeriveIrTransformer(
     private val mathToDerive:
         Map<IrSimpleFunctionSymbol, IrSimpleFunctionSymbol>
     private val doubleOpToDerive: Map<String, IrSimpleFunctionSymbol>
-    private val deriveDoubleToDerive: Map<String, IrSimpleFunctionSymbol>
-    private val derivativeGetter: IrSimpleFunctionSymbol?
+    private val deriveDoubleToDerive =
+        mutableMapOf<String, IrSimpleFunctionSymbol>()
+    private val derivativeGetter: IrSimpleFunctionSymbol
 
     init {
         val deriveClass = context.referenceClass(DeriveDoubleClassId)
@@ -94,11 +103,11 @@ public class DeriveIrTransformer(
         deriveDoubleConstructor = deriveClass.constructors
             .single { it.owner.valueParameters.size == 2 }
 
-        plusOpSymbol = deriveClass.getDeriveFunction("plus")!!
-        minusOpSymbol = deriveClass.getDeriveFunction("minus")!!
-        timesOpSymbol = deriveClass.getDeriveFunction("times")!!
-        divOpSymbol = deriveClass.getDeriveFunction("div")!!
-        unaryMinusOpSymbol = deriveClass.getDeriveFunction("unaryMinus")!!
+        plusOpSymbol = deriveClass.findMember("plus")!!
+        minusOpSymbol = deriveClass.findMember("minus")!!
+        timesOpSymbol = deriveClass.findMember("times")!!
+        divOpSymbol = deriveClass.findMember("div")!!
+        unaryMinusOpSymbol = deriveClass.findMember("unaryMinus")!!
 
         sinSymbol = context.referenceFunctions(
             CallableId(FqName("derive"), Name.identifier("sin")),
@@ -148,62 +157,49 @@ public class DeriveIrTransformer(
             "unaryMinus" to unaryMinusOpSymbol,
         )
 
-        // Build fDerive functions directly in original files (not in generated stubs)
-        // to ensure proper source info for JVM codegen
-        deriveDoubleToDerive = deriveFunctions.associate { original ->
-            val deriveName = "${original.name.asString()}Derive"
-            // Remove stub from generated file if it exists
-            deriveStubs[deriveName]?.let { stub ->
-                (
-                    stub.parent as? org.jetbrains.kotlin.ir.declarations
-                        .IrDeclarationContainer
-                    )?.declarations?.remove(stub)
-            }
-            val derived = buildDerivedFunction(original, deriveName)
-            populateDerivedFunctionBody(original, derived)
-            original.name.asString() to derived.symbol
-        }
+        relocateAndBuildDerivedFunctions(deriveClass)
+        populateOverloadStubs()
 
-        // Populate overload stubs: f(x: DeriveDouble) -> fDerive(x)
-        for ((originalName, overloadStub) in overloadStubs) {
-            val deriveSymbol = deriveDoubleToDerive[originalName]
-            if (deriveSymbol != null) {
-                // Move overload stub from generated file to original file
-                val original = deriveFunctions.find {
-                    it.name.asString() == originalName
-                }
-                overloadStub.parent?.let { parent ->
-                    (
-                        parent as? org.jetbrains.kotlin.ir.declarations
-                            .IrDeclarationContainer
-                        )
-                        ?.declarations?.remove(overloadStub)
-                }
-                original?.parent?.let { parent ->
-                    (
-                        parent as? org.jetbrains.kotlin.ir.declarations
-                            .IrDeclarationContainer
-                        )
-                        ?.declarations?.add(overloadStub)
-                }
-                populateOverloadBody(overloadStub, deriveSymbol)
-            }
-        }
-
-        // Get derivative property getter
-        val deriveClassOwner = deriveClass.owner
-        val derivativeProp = deriveClassOwner.declarations
+        val derivativeProp = deriveClass.owner.declarations
             .filterIsInstance<IrProperty>()
             .find { it.name.asString() == "derivative" }
         derivativeGetter = derivativeProp?.getter?.symbol
+            ?: error("DeriveDouble.derivative property not found")
     }
 
-    private fun IrClassSymbol.getDeriveFunction(
-        name: String,
-    ): IrSimpleFunctionSymbol? = owner.declarations
-        .filterIsInstance<IrSimpleFunction>()
-        .find { it.name.asString() == name }
-        ?.symbol
+    private fun relocateAndBuildDerivedFunctions(deriveClass: IrClassSymbol) {
+        for (original in deriveFunctions) {
+            val deriveName = "${original.name.asString()}Derive"
+            deriveStubs[deriveName]?.let { stub ->
+                stub.parentAsContainer()?.declarations?.remove(stub)
+            }
+            val derived = buildDerivedFunction(original, deriveName)
+            populateDerivedFunctionBody(original, derived)
+            deriveDoubleToDerive[original.name.asString()] = derived.symbol
+        }
+    }
+
+    private fun populateOverloadStubs() {
+        for ((originalName, overloadStub) in overloadStubs) {
+            val deriveSymbol = deriveDoubleToDerive[originalName] ?: continue
+            val original = deriveFunctions.find {
+                it.name.asString() == originalName
+            } ?: continue
+
+            overloadStub.parentAsContainer()?.declarations?.remove(overloadStub)
+            original.parentAsContainer()?.declarations?.add(overloadStub)
+            populateOverloadBody(overloadStub, deriveSymbol)
+        }
+    }
+
+    private fun IrDeclaration.parentAsContainer(): IrDeclarationContainer? =
+        parent as? IrDeclarationContainer
+
+    private fun IrClassSymbol.findMember(name: String): IrSimpleFunctionSymbol? =
+        owner.declarations
+            .filterIsInstance<IrSimpleFunction>()
+            .find { it.name.asString() == name }
+            ?.symbol
 
     private fun IrSimpleFunctionSymbol.isSingleDoubleParam(): Boolean =
         owner.valueParameters.size == 1 &&
@@ -214,74 +210,68 @@ public class DeriveIrTransformer(
 
     override fun visitCall(expression: IrCall): IrExpression {
         val owner = expression.symbol.owner
-        val parentPackage = owner.parent
-            as? org.jetbrains.kotlin.ir.declarations.IrPackageFragment
+        val parentPackage = owner.parent as? org.jetbrains.kotlin.ir.declarations.IrPackageFragment
         val callableId = CallableId(
             packageName = parentPackage?.packageFqName ?: FqName.ROOT,
             callableName = owner.name,
         )
+
         if (callableId == DeriveCallableId) {
             val lambdaArg = expression.getValueArgument(0)
             if (lambdaArg is IrFunctionExpression) {
-                val transformed = transformDeriveLambda(lambdaArg)
-                if (transformed != null) {
-                    val getter = derivativeGetter ?: return expression
-                    val derivativeCall = IrCallImpl(
-                        startOffset = SYNTHETIC_OFFSET,
-                        endOffset = SYNTHETIC_OFFSET,
-                        type = doubleType,
-                        symbol = getter,
-                        origin = null,
-                        superQualifierSymbol = null,
-                    ).apply {
-                        dispatchReceiver = transformed
-                    }
-                    return derivativeCall
+                transformDeriveLambda(lambdaArg)?.let { transformed ->
+                    return makeDerivativeGetterCall(transformed, expression)
                 }
             }
         }
+
         if (callableId == DerivativeCallableId) {
-            val arg = expression.getValueArgument(0)
-            when (arg) {
+            when (val arg = expression.getValueArgument(0)) {
                 is IrFunctionExpression -> {
-                    val transformed = transformDerivativeLambda(arg)
-                    if (transformed != null) {
-                        return transformed
-                    }
+                    transformDerivativeLambda(arg)?.let { return it }
                 }
                 is IrFunctionReference -> {
-                    val transformed = transformDerivativeFunctionRef(
-                        arg,
-                        expression,
-                    )
-                    if (transformed != null) {
-                        return transformed
-                    }
+                    transformDerivativeFunctionRef(arg, expression)?.let { return it }
                 }
             }
         }
+
         return super.visitCall(expression)
     }
 
-    private var derivativeCounter = 0
+    private fun makeDerivativeGetterCall(
+        transformed: IrExpression,
+        context: IrExpression,
+    ): IrExpression {
+        val call = IrCallImpl(
+            startOffset = SYNTHETIC_OFFSET,
+            endOffset = SYNTHETIC_OFFSET,
+            type = doubleType,
+            symbol = derivativeGetter,
+            origin = null,
+            superQualifierSymbol = null,
+        ).apply {
+            dispatchReceiver = transformed
+        }
+        return call
+    }
+
+    private fun extractLambdaBodyExpression(lambdaBody: IrBody?): IrExpression? {
+        return when (lambdaBody) {
+            is IrExpressionBody -> lambdaBody.expression
+            is IrBlockBody -> {
+                val lastStmt = lambdaBody.statements.lastOrNull()
+                (lastStmt as? IrReturn)?.value
+            }
+            else -> null
+        }
+    }
 
     private fun transformDerivativeLambda(
         expression: IrFunctionExpression,
     ): IrExpression? {
         val lambda = expression.function
-        val lambdaBody = lambda.body
-
-        val sourceExpression: IrExpression = when (lambdaBody) {
-            is IrExpressionBody -> lambdaBody.expression
-            is IrBlockBody -> {
-                val lastStmt = lambdaBody.statements.lastOrNull()
-                when (lastStmt) {
-                    is IrReturn -> lastStmt.value
-                    else -> return null
-                }
-            }
-            else -> return null
-        }
+        val sourceExpression = extractLambdaBodyExpression(lambda.body) ?: return null
 
         val start = expression.startOffset.coerceAtLeast(0)
         val end = expression.endOffset.coerceAtLeast(0)
@@ -289,28 +279,21 @@ public class DeriveIrTransformer(
         val transformed = sourceExpression
             .deepCopyWithSymbols(lambda)
             .transform(DeriveBlockTransformer(), null)
-            as IrExpression
 
-        fixOffsetsRecursive(
-            transformed,
-            sourceExpression.startOffset,
-            sourceExpression.endOffset,
-        )
+        fixOffsetsRecursive(transformed, start, end)
 
         val derivativeCall = IrCallImpl(
             startOffset = start,
             endOffset = end,
             type = doubleType,
-            symbol = derivativeGetter!!,
+            symbol = derivativeGetter,
             origin = null,
             superQualifierSymbol = null,
         ).apply {
             dispatchReceiver = transformed
         }
 
-        lambda.body = context.irFactory
-            .createExpressionBody(start, end, derivativeCall)
-
+        lambda.body = context.irFactory.createExpressionBody(start, end, derivativeCall)
         return expression
     }
 
@@ -324,33 +307,18 @@ public class DeriveIrTransformer(
         if (target.valueParameters.size != 1) return null
         if (target.returnType != context.irBuiltIns.doubleType) return null
 
-        val body = target.body ?: return null
-        val sourceExpression: IrExpression = when (body) {
-            is IrExpressionBody -> body.expression
-            is IrBlockBody -> {
-                val lastStmt = body.statements.lastOrNull()
-                when (lastStmt) {
-                    is IrReturn -> lastStmt.value
-                    else -> return null
-                }
-            }
-            else -> return null
-        }
+        val sourceExpression = extractLambdaBodyExpression(target.body) ?: return null
 
         val start = outerCall.startOffset.coerceAtLeast(0)
         val end = outerCall.endOffset.coerceAtLeast(0)
 
-        val parent = target.parent as? IrDeclarationContainer ?: return null
-        val funcName = Name.identifier(
-            "derivative_ref_${derivativeRefCounter++}",
-        )
+        val parent = target.parentAsContainer() ?: return null
+        val funcName = Name.identifier("derivative_ref_${derivativeRefCounter++}")
 
         val derivedFunc = context.irFactory.buildFun {
             name = funcName
-            origin = org.jetbrains.kotlin.ir.declarations
-                .IrDeclarationOrigin.DEFINED
-            modality = org.jetbrains.kotlin.descriptors
-                .Modality.FINAL
+            origin = IrDeclarationOrigin.DEFINED
+            modality = Modality.FINAL
             returnType = doubleType
         }.apply {
             this.parent = parent
@@ -360,46 +328,32 @@ public class DeriveIrTransformer(
             )
             val oldParamSymbol = target.valueParameters[0].symbol
             val cloned = sourceExpression.deepCopyWithSymbols(this)
-            cloned.transform(
-                object : IrElementTransformerVoid() {
-                    override fun visitGetValue(
-                        expression: IrGetValue,
-                    ): IrExpression {
-                        if (expression.symbol == oldParamSymbol) {
-                            expression.symbol = newParam.symbol
-                        }
-                        return super.visitGetValue(expression)
-                    }
-                },
-                null,
-            )
-            val transformed = cloned
-                .transform(DeriveBlockTransformer(), null)
-                as IrExpression
-            fixOffsetsRecursive(
-                transformed,
-                sourceExpression.startOffset,
-                sourceExpression.endOffset,
-            )
+
+            remapParameterSymbol(cloned, oldParamSymbol, newParam.symbol)
+
+            val transformed = cloned.transform(DeriveBlockTransformer(), null)
+            fixOffsetsRecursive(transformed, start, end)
 
             val derivativeCall = IrCallImpl(
                 startOffset = start,
                 endOffset = end,
                 type = doubleType,
-                symbol = derivativeGetter!!,
+                symbol = derivativeGetter,
                 origin = null,
                 superQualifierSymbol = null,
             ).apply {
                 dispatchReceiver = transformed
             }
 
-            this.body = context.irFactory
-                .createExpressionBody(start, end, derivativeCall)
+            this.body = context.irFactory.createExpressionBody(
+                start,
+                end,
+                derivativeCall,
+            )
         }
 
         parent.declarations.add(derivedFunc)
 
-        @Suppress("INVISIBLE_REFERENCE")
         return IrFunctionReferenceImpl(
             startOffset = start,
             endOffset = end,
@@ -412,81 +366,59 @@ public class DeriveIrTransformer(
         }
     }
 
-    private fun transformDeriveLambda(
-        expression: IrFunctionExpression,
-    ): IrExpression? {
-        val lambda = expression.function
-        val lambdaBody = lambda.body
-
-        val sourceExpression: IrExpression = when (lambdaBody) {
-            is IrExpressionBody -> lambdaBody.expression
-            is IrBlockBody -> {
-                val lastStmt = lambdaBody.statements.lastOrNull()
-                when (lastStmt) {
-                    is IrReturn -> lastStmt.value
-                    else -> return null
-                }
-            }
-            else -> return null
-        }
-
-        val clonedBody = sourceExpression.deepCopyWithSymbols(lambda.parent)
-        val transformed = clonedBody.transform(
-            DeriveBlockTransformer(),
-            null,
-        ) as IrExpression
-
-        // Fix synthetic offsets to prevent JVM codegen assertion failures
-        fixOffsetsRecursive(
-            transformed,
-            sourceExpression.startOffset,
-            sourceExpression.endOffset,
-        )
-
-        return transformed
-    }
-
-    private fun fixOffsetsRecursive(
-        element: org.jetbrains.kotlin.ir.IrElement,
-        fallbackStart: Int,
-        fallbackEnd: Int,
+    private fun remapParameterSymbol(
+        element: IrElement,
+        oldSymbol: IrValueSymbol,
+        newSymbol: IrValueSymbol,
     ) {
-        if (element is org.jetbrains.kotlin.ir.expressions.IrExpression) {
-            if (element.startOffset == SYNTHETIC_OFFSET) {
-                element.startOffset = fallbackStart
-            }
-            if (element.endOffset == SYNTHETIC_OFFSET) {
-                element.endOffset = fallbackEnd
-            }
-        }
-        element.acceptChildren(
-            object :
-                org.jetbrains.kotlin.ir.visitors.IrVisitorVoid() {
-                override fun visitElement(
-                    el: org.jetbrains.kotlin.ir.IrElement,
-                ) {
-                    if (el is org.jetbrains.kotlin.ir.expressions
-                            .IrExpression
-                    ) {
-                        if (el.startOffset == SYNTHETIC_OFFSET) {
-                            el.startOffset = fallbackStart
-                        }
-                        if (el.endOffset == SYNTHETIC_OFFSET) {
-                            el.endOffset = fallbackEnd
-                        }
+        element.transform(
+            object : IrElementTransformerVoid() {
+                override fun visitGetValue(expression: IrGetValue): IrExpression {
+                    if (expression.symbol == oldSymbol) {
+                        expression.symbol = newSymbol
                     }
-                    super.visitElement(el)
+                    return super.visitGetValue(expression)
                 }
             },
             null,
         )
     }
 
-    override fun visitFunction(declaration: IrFunction): IrStatement {
-        if (declaration !is IrSimpleFunction) {
-            return super.visitFunction(declaration)
+    private fun transformDeriveLambda(
+        expression: IrFunctionExpression,
+    ): IrExpression? {
+        val lambda = expression.function
+        val sourceExpression = extractLambdaBodyExpression(lambda.body) ?: return null
+
+        val clonedBody = sourceExpression.deepCopyWithSymbols(lambda.parent)
+        val transformed = clonedBody.transform(DeriveBlockTransformer(), null)
+
+        fixOffsetsRecursive(transformed, clonedBody.startOffset, clonedBody.endOffset)
+        return transformed
+    }
+
+    private fun fixOffsetsRecursive(
+        element: IrElement,
+        fallbackStart: Int,
+        fallbackEnd: Int,
+    ) {
+        fun fixExpression(expr: IrExpression) {
+            if (expr.startOffset == SYNTHETIC_OFFSET) expr.startOffset = fallbackStart
+            if (expr.endOffset == SYNTHETIC_OFFSET) expr.endOffset = fallbackEnd
         }
-        return super.visitFunction(declaration)
+
+        if (element is IrExpression) fixExpression(element)
+
+        element.acceptChildren(
+            object : IrVisitorVoid() {
+                @Suppress("PARAMETER_NAME_CHANGED_ON_OVERRIDE")
+                override fun visitElement(elem: IrElement) {
+                    if (elem is IrExpression) fixExpression(elem)
+                    super.visitElement(elem)
+                }
+            },
+            null,
+        )
     }
 
     private fun buildDerivedFunction(
@@ -505,34 +437,28 @@ public class DeriveIrTransformer(
 
         derived.parent = original.parent
 
-        val copiedFunction = original.deepCopyWithSymbols(
-            original.parent,
-        ) as IrSimpleFunction
+        val copied = original.deepCopyWithSymbols(original.parent)
 
-        copiedFunction.dispatchReceiverParameter?.let { param ->
+        copied.dispatchReceiverParameter?.let { param ->
             param.parent = derived
             param.type = param.type.remapDouble()
             derived.dispatchReceiverParameter = param
         }
 
-        copiedFunction.extensionReceiverParameter?.let { param ->
+        copied.extensionReceiverParameter?.let { param ->
             param.parent = derived
             param.type = param.type.remapDouble()
             derived.extensionReceiverParameter = param
         }
 
-        derived.valueParameters =
-            copiedFunction.valueParameters.map { param ->
-                param.apply {
-                    parent = derived
-                    type = type.remapDouble()
-                }
+        derived.valueParameters = copied.valueParameters.map { param ->
+            param.apply {
+                parent = derived
+                type = type.remapDouble()
             }
-
-        val parent = original.parent
-        if (parent is IrDeclarationContainer) {
-            parent.declarations.add(derived)
         }
+
+        original.parentAsContainer()?.declarations?.add(derived)
 
         return derived
     }
@@ -541,49 +467,14 @@ public class DeriveIrTransformer(
         original: IrSimpleFunction,
         derived: IrSimpleFunction,
     ) {
-        val copiedFunction = original.deepCopyWithSymbols(
-            original.parent,
-        ) as IrSimpleFunction
+        val copied = original.deepCopyWithSymbols(original.parent)
 
-        val paramSymbolMap: Map<IrValueSymbol, IrValueSymbol> =
-            copiedFunction.valueParameters.zip(derived.valueParameters)
-                .associate { (src, dst) -> src.symbol to dst.symbol }
+        val paramSymbolMap = copied.valueParameters.zip(derived.valueParameters)
+            .associate { (src, dst) -> src.symbol to dst.symbol }
 
-        val bodyCopied = copiedFunction.body
-        val transformedBody = bodyCopied?.transform(
-            FunctionBodyTransformer(
-                derived.symbol,
-                paramSymbolMap,
-            ),
-            null,
-        )
-        derived.body = transformedBody
-    }
-
-    private fun fixOffsets(
-        body: org.jetbrains.kotlin.ir.expressions.IrBody?,
-        fallbackStart: Int,
-        fallbackEnd: Int,
-    ) {
-        body?.accept(
-            object :
-                org.jetbrains.kotlin.ir.visitors.IrVisitorVoid() {
-                override fun visitElement(
-                    element: org.jetbrains.kotlin.ir.IrElement,
-                ) {
-                    if (element is org.jetbrains.kotlin.ir.expressions
-                            .IrExpression
-                    ) {
-                        if (element.startOffset == SYNTHETIC_OFFSET) {
-                            element.startOffset = fallbackStart
-                        }
-                        if (element.endOffset == SYNTHETIC_OFFSET) {
-                            element.endOffset = fallbackEnd
-                        }
-                    }
-                    super.visitElement(element)
-                }
-            },
+        val bodyCopied = copied.body
+        derived.body = bodyCopied?.transform(
+            FunctionBodyTransformer(derived.symbol, paramSymbolMap),
             null,
         )
     }
@@ -594,10 +485,11 @@ public class DeriveIrTransformer(
     ) {
         val param = overload.valueParameters.singleOrNull() ?: return
         val offset = overload.startOffset.coerceAtLeast(0)
+        val end = overload.endOffset.coerceAtLeast(0)
 
         val call = IrCallImpl(
             startOffset = offset,
-            endOffset = overload.endOffset.coerceAtLeast(0),
+            endOffset = end,
             type = deriveDoubleType,
             symbol = deriveSymbol,
             origin = null,
@@ -605,151 +497,95 @@ public class DeriveIrTransformer(
         ).apply {
             putValueArgument(
                 0,
-                IrGetValueImpl(
-                    offset,
-                    overload.endOffset.coerceAtLeast(0),
-                    param.type,
-                    param.symbol,
-                ),
+                IrGetValueImpl(offset, end, param.type, param.symbol),
             )
         }
 
-        overload.body = context.irFactory.createExpressionBody(
-            offset,
-            overload.endOffset.coerceAtLeast(0),
-            call,
-        )
+        overload.body = context.irFactory.createExpressionBody(offset, end, call)
     }
 
-    private inner class DeriveBlockTransformer :
-        IrElementTransformerVoid() {
+    private fun transformMathOrOpCall(call: IrCall): IrCall {
+        val funcName = call.symbol.owner.name.asString()
 
-        private var firstConstantSeen = false
+        doubleOpToDerive[funcName]?.let { deriveOp ->
+            return IrCallImpl(
+                startOffset = SYNTHETIC_OFFSET,
+                endOffset = SYNTHETIC_OFFSET,
+                type = deriveDoubleType,
+                symbol = deriveOp,
+                origin = null,
+                superQualifierSymbol = null,
+            ).apply {
+                dispatchReceiver = call.dispatchReceiver
+                extensionReceiver = call.extensionReceiver
+                repeat(call.valueArgumentsCount) { i ->
+                    putValueArgument(i, call.getValueArgument(i))
+                }
+            }
+        }
+
+        mathToDerive[call.symbol]?.let { mathReplace ->
+            val args = (0 until call.valueArgumentsCount).map { i ->
+                call.getValueArgument(i)
+            }
+            val argAsReceiver = args.firstOrNull() ?: call.dispatchReceiver
+            return IrCallImpl(
+                startOffset = SYNTHETIC_OFFSET,
+                endOffset = SYNTHETIC_OFFSET,
+                type = deriveDoubleType,
+                symbol = mathReplace,
+                origin = null,
+                superQualifierSymbol = null,
+            ).apply {
+                extensionReceiver = argAsReceiver
+                args.drop(1).forEachIndexed { i, arg ->
+                    putValueArgument(i, arg)
+                }
+            }
+        }
+
+        return call
+    }
+
+    private inner class DeriveBlockTransformer : IrElementTransformerVoid() {
+
+        private var independentVariableSeen = false
 
         override fun visitExpression(expression: IrExpression): IrExpression {
             val transformed = super.visitExpression(expression)
-                as IrExpression
             transformed.type = transformed.type.remapDouble()
             return transformed
         }
 
         override fun visitConst(expression: IrConst): IrExpression {
             if (expression.kind == IrConstKind.Double) {
-                val derivative = if (!firstConstantSeen) {
-                    firstConstantSeen = true
+                val derivative = if (!independentVariableSeen) {
+                    independentVariableSeen = true
                     1.0
                 } else {
                     0.0
                 }
-                val start = expression.startOffset.coerceAtLeast(0)
-                val end = expression.endOffset.coerceAtLeast(0)
-                return IrConstructorCallImpl.fromSymbolOwner(
-                    start,
-                    end,
-                    deriveDoubleType,
-                    deriveDoubleConstructor,
-                ).apply {
-                    putValueArgument(
-                        0,
-                        IrConstImpl.double(
-                            start,
-                            end,
-                            doubleType,
-                            expression.value as Double,
-                        ),
-                    )
-                    putValueArgument(
-                        1,
-                        IrConstImpl.double(
-                            start,
-                            end,
-                            doubleType,
-                            derivative,
-                        ),
-                    )
-                }
+                return buildDeriveDoubleConst(expression, derivative)
             }
             return super.visitConst(expression)
         }
 
         override fun visitGetValue(expression: IrGetValue): IrExpression {
             if (expression.type == doubleType) {
-                val start = expression.startOffset.coerceAtLeast(0)
-                val end = expression.endOffset.coerceAtLeast(0)
-                return IrConstructorCallImpl.fromSymbolOwner(
-                    start,
-                    end,
-                    deriveDoubleType,
-                    deriveDoubleConstructor,
-                ).apply {
-                    putValueArgument(
-                        0,
-                        super.visitGetValue(expression),
-                    )
-                    putValueArgument(
-                        1,
-                        IrConstImpl.double(
-                            start,
-                            end,
-                            doubleType,
-                            1.0,
-                        ),
-                    )
-                }
+                return buildDeriveDoubleConst(expression, 1.0)
             }
             return super.visitGetValue(expression)
         }
 
         override fun visitCall(expression: IrCall): IrExpression {
             val call = super.visitCall(expression) as IrCall
+
+            transformMathOrOpCall(call).let { replaced ->
+                if (replaced !== call) return replaced
+            }
+
             val funcName = expression.symbol.owner.name.asString()
-
-            val deriveOp = doubleOpToDerive[funcName]
-            if (deriveOp != null) {
-                return IrCallImpl(
-                    startOffset = SYNTHETIC_OFFSET,
-                    endOffset = SYNTHETIC_OFFSET,
-                    type = deriveDoubleType,
-                    symbol = deriveOp,
-                    origin = null,
-                    superQualifierSymbol = null,
-                ).apply {
-                    dispatchReceiver = call.dispatchReceiver
-                    extensionReceiver = call.extensionReceiver
-                    (0 until call.valueArgumentsCount).forEach { i ->
-                        putValueArgument(i, call.getValueArgument(i))
-                    }
-                }
-            }
-
-            val mathReplace = mathToDerive[expression.symbol]
-            if (mathReplace != null) {
-                val args = (0 until call.valueArgumentsCount).map { i ->
-                    call.getValueArgument(i)
-                }
-                val argAsReceiver = args.firstOrNull()
-                    ?: call.dispatchReceiver
-                return IrCallImpl(
-                    startOffset = SYNTHETIC_OFFSET,
-                    endOffset = SYNTHETIC_OFFSET,
-                    type = deriveDoubleType,
-                    symbol = mathReplace,
-                    origin = null,
-                    superQualifierSymbol = null,
-                ).apply {
-                    extensionReceiver = argAsReceiver
-                    args.drop(1).forEachIndexed { i, arg ->
-                        putValueArgument(i, arg)
-                    }
-                }
-            }
-
-            // Replace f(Double) -> fDerive for @Derive functions
-            val deriveFunc = deriveDoubleToDerive[funcName]
-            if (deriveFunc != null) {
-                val args = (0 until call.valueArgumentsCount).map { i ->
-                    call.getValueArgument(i)
-                }
+            deriveDoubleToDerive[funcName]?.let { deriveFunc ->
                 return IrCallImpl(
                     startOffset = SYNTHETIC_OFFSET,
                     endOffset = SYNTHETIC_OFFSET,
@@ -758,55 +594,45 @@ public class DeriveIrTransformer(
                     origin = null,
                     superQualifierSymbol = null,
                 ).apply {
-                    args.forEachIndexed { i, arg ->
-                        putValueArgument(i, arg)
+                    repeat(call.valueArgumentsCount) { i ->
+                        putValueArgument(i, call.getValueArgument(i))
                     }
                 }
             }
 
             return call
         }
+
+        private fun buildDeriveDoubleConst(
+            value: IrExpression,
+            derivative: Double,
+        ): IrConstructorCallImpl {
+            val start = value.startOffset.coerceAtLeast(0)
+            val end = value.endOffset.coerceAtLeast(0)
+            return IrConstructorCallImpl.fromSymbolOwner(
+                start, end, deriveDoubleType, deriveDoubleConstructor,
+            ).apply {
+                putValueArgument(0, value)
+                putValueArgument(1, IrConstImpl.double(start, end, doubleType, derivative))
+            }
+        }
     }
 
     private inner class FunctionBodyTransformer(
         private val returnTarget: IrReturnTargetSymbol,
-        private val paramSymbolMap: Map<IrValueSymbol, IrValueSymbol>,
+        private val paramSymbolMap: Map<IrValueParameterSymbol, IrValueSymbol>,
     ) : IrElementTransformerVoid() {
 
         override fun visitExpression(expression: IrExpression): IrExpression {
             val transformed = super.visitExpression(expression)
-                as IrExpression
             transformed.type = transformed.type.remapDouble()
             return transformed
         }
 
         override fun visitConst(expression: IrConst): IrExpression {
             if (expression.kind == IrConstKind.Double) {
-                return IrConstructorCallImpl.fromSymbolOwner(
-                    SYNTHETIC_OFFSET,
-                    SYNTHETIC_OFFSET,
-                    deriveDoubleType,
-                    deriveDoubleConstructor,
-                ).apply {
-                    putValueArgument(
-                        0,
-                        IrConstImpl.double(
-                            SYNTHETIC_OFFSET,
-                            SYNTHETIC_OFFSET,
-                            doubleType,
-                            expression.value as Double,
-                        ),
-                    )
-                    putValueArgument(
-                        1,
-                        IrConstImpl.double(
-                            SYNTHETIC_OFFSET,
-                            SYNTHETIC_OFFSET,
-                            doubleType,
-                            0.0,
-                        ),
-                    )
-                }
+                System.err.println("Here before crash!")
+                return buildDeriveDoubleConstZero(expression.value as Double)
             }
             return super.visitConst(expression)
         }
@@ -824,48 +650,7 @@ public class DeriveIrTransformer(
 
         override fun visitCall(expression: IrCall): IrExpression {
             val call = super.visitCall(expression) as IrCall
-            val funcName = expression.symbol.owner.name.asString()
-            val deriveOp = doubleOpToDerive[funcName]
-            if (deriveOp != null) {
-                return IrCallImpl(
-                    startOffset = SYNTHETIC_OFFSET,
-                    endOffset = SYNTHETIC_OFFSET,
-                    type = deriveDoubleType,
-                    symbol = deriveOp,
-                    origin = null,
-                    superQualifierSymbol = null,
-                ).apply {
-                    dispatchReceiver = call.dispatchReceiver
-                    extensionReceiver = call.extensionReceiver
-                    (0 until call.valueArgumentsCount).forEach { i ->
-                        putValueArgument(i, call.getValueArgument(i))
-                    }
-                }
-            }
-
-            val mathReplace = mathToDerive[expression.symbol]
-            if (mathReplace != null) {
-                val args = (0 until call.valueArgumentsCount).map { i ->
-                    call.getValueArgument(i)
-                }
-                val argAsReceiver = args.firstOrNull()
-                    ?: call.dispatchReceiver
-                return IrCallImpl(
-                    startOffset = SYNTHETIC_OFFSET,
-                    endOffset = SYNTHETIC_OFFSET,
-                    type = deriveDoubleType,
-                    symbol = mathReplace,
-                    origin = null,
-                    superQualifierSymbol = null,
-                ).apply {
-                    extensionReceiver = argAsReceiver
-                    args.drop(1).forEachIndexed { i, arg ->
-                        putValueArgument(i, arg)
-                    }
-                }
-            }
-
-            return call
+            return transformMathOrOpCall(call)
         }
 
         override fun visitReturn(expression: IrReturn): IrExpression {
@@ -873,6 +658,21 @@ public class DeriveIrTransformer(
             (returnExpr as IrReturnImpl).returnTargetSymbol = returnTarget
             return returnExpr
         }
+
+        private fun buildDeriveDoubleConstZero(value: Double): IrConstructorCallImpl =
+            IrConstructorCallImpl.fromSymbolOwner(
+                SYNTHETIC_OFFSET, SYNTHETIC_OFFSET,
+                deriveDoubleType, deriveDoubleConstructor,
+            ).apply {
+                putValueArgument(
+                    0,
+                    IrConstImpl.double(SYNTHETIC_OFFSET, SYNTHETIC_OFFSET, doubleType, value),
+                )
+                putValueArgument(
+                    1,
+                    IrConstImpl.double(SYNTHETIC_OFFSET, SYNTHETIC_OFFSET, doubleType, 0.0),
+                )
+            }
     }
 
     private fun IrType.remapDouble(): IrType =

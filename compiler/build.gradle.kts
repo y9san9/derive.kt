@@ -17,6 +17,9 @@ kotlin {
         optIn.add(
             "org.jetbrains.kotlin.DeprecatedForRemovalCompilerApi",
         )
+        optIn.add(
+            "org.jetbrains.kotlin.ir.symbols.UnsafeDuringIrConstructionAPI",
+        )
     }
 }
 
